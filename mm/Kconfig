@@ -311,6 +311,14 @@ config KSM
 	  until a program has madvised that an area is MADV_MERGEABLE, and
 	  root has set /sys/kernel/mm/ksm/run to 1 (if CONFIG_SYSFS is set).
 
+config KSM_MERGE_SINGLE
+    bool "enable the merging of all pages to prevent timing differences"
+    depends on KSM
+
+config KSM_MERGE_SIMILAR
+    bool "search for similar pages and merge them with themself"
+    depends on KSM_MERGE_SINGLE
+
 config DEFAULT_MMAP_MIN_ADDR
 	int "Low address space to protect from user allocation"
 	depends on MMU
