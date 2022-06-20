@@ -152,6 +152,9 @@ struct ksm_scan {
 	unsigned long seqnr;
 };
 
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+struct stable_graph_node;
+#endif
 /**
  * struct stable_node - node of the stable rbtree
  * @node: rb node of this ksm page in the stable tree
@@ -190,8 +193,26 @@ struct stable_node {
 #ifdef CONFIG_NUMA
 	int nid;
 #endif
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+	struct stable_graph_node *graph_node;
+#endif
+};
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+
+struct stable_graph_edge {
+	struct list_head list;
+	struct stable_graph_node *to;
+	struct stable_graph_edge *rev;
 };
 
+struct stable_graph_node {
+	struct list_head node_list;
+	struct list_head edge_list;
+	struct stable_node *node;
+};
+
+struct unstable_graph_node;
+#endif
 /**
  * struct rmap_item - reverse mapping item for virtual addresses
  * @rmap_list: next rmap_item in mm_slot's singly-linked rmap_list
@@ -216,13 +237,34 @@ struct rmap_item {
 	unsigned long address; /* + low bits used for flags below */
 	unsigned int oldchecksum; /* when unstable */
 	union {
-		struct rb_node node; /* when node of unstable tree */
+		struct {
+			struct rb_node node; /* when node of unstable tree */
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+			struct unstable_graph_node *graph_node;
+#endif
+		};
 		struct { /* when listed from stable tree */
 			struct stable_node *head;
 			struct hlist_node hlist;
 		};
 	};
 };
+
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+
+struct unstable_graph_edge {
+	struct list_head list;
+	struct unstable_graph_node *to;
+	struct unstable_graph_edge *rev;
+};
+
+struct unstable_graph_node {
+	struct list_head node_list;
+	struct list_head edge_list;
+	struct unstable_node *node;
+	bool changed;
+};
+#endif
 
 #define SEQNR_MASK 0x0ff /* low bits of unstable tree seqnr */
 #define UNSTABLE_FLAG 0x100 /* is a node of the unstable tree */
@@ -233,6 +275,12 @@ static struct rb_root one_stable_tree[1] = { RB_ROOT };
 static struct rb_root one_unstable_tree[1] = { RB_ROOT };
 static struct rb_root *root_stable_tree = one_stable_tree;
 static struct rb_root *root_unstable_tree = one_unstable_tree;
+
+/* The stable and unstable graphs */
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+static LIST_HEAD(stable_graph);
+static LIST_HEAD(unstable_graph);
+#endif
 
 /* Recently migrated nodes of stable tree, pending proper placement */
 static LIST_HEAD(migrate_nodes);
@@ -251,6 +299,10 @@ static struct ksm_scan ksm_scan = {
 static struct kmem_cache *rmap_item_cache;
 static struct kmem_cache *stable_node_cache;
 static struct kmem_cache *mm_slot_cache;
+static struct kmem_cache *stable_graph_node_cache;
+static struct kmem_cache *stable_graph_edge_cache;
+static struct kmem_cache *unstable_graph_node_cache;
+static struct kmem_cache *unstable_graph_edge_cache;
 
 /* The number of nodes in the stable tree */
 static unsigned long ksm_pages_shared;
@@ -281,6 +333,12 @@ static unsigned int ksm_thread_pages_to_scan = 100;
 
 /* Milliseconds ksmd should sleep between batches */
 static unsigned int ksm_thread_sleep_millisecs = 20;
+
+/* Number of detected similar pages */
+static unsigned long ksm_detected_similar_pages = 0;
+
+/* Similarity needed for two pages to be similar */
+static unsigned int ksm_similar_page_threshold = 128;
 
 /* Checksum of an empty (zeroed) page */
 static unsigned int zero_checksum __read_mostly;
@@ -326,9 +384,40 @@ static int __init ksm_slab_init(void)
 	mm_slot_cache = KSM_KMEM_CACHE(mm_slot, 0);
 	if (!mm_slot_cache)
 		goto out_free2;
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+	stable_graph_node_cache = KSM_KMEM_CACHE(stable_graph_node, 0);
+	if (!stable_graph_node_cache) {
+		goto out_free3;
+	}
+
+	stable_graph_edge_cache = KSM_KMEM_CACHE(stable_graph_edge, 0);
+	if (!stable_graph_edge_cache) {
+		goto out_free4;
+	}
+
+	unstable_graph_node_cache = KSM_KMEM_CACHE(unstable_graph_node, 0);
+	if (!unstable_graph_node_cache) {
+		goto out_free5;
+	}
+
+	unstable_graph_edge_cache = KSM_KMEM_CACHE(unstable_graph_edge, 0);
+	if (!unstable_graph_edge_cache) {
+		goto out_free6;
+	}
+#endif
 
 	return 0;
 
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+out_free6:
+	kmem_cache_destroy(unstable_graph_edge_cache);
+out_free5:
+	kmem_cache_destroy(unstable_graph_node_cache);
+out_free4:
+	kmem_cache_destroy(stable_graph_edge_cache);
+out_free3:
+	kmem_cache_destroy(stable_graph_node_cache);
+#endif
 out_free2:
 	kmem_cache_destroy(stable_node_cache);
 out_free1:
@@ -339,6 +428,12 @@ out:
 
 static void __init ksm_slab_free(void)
 {
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+	kmem_cache_destroy(unstable_graph_edge_cache);
+	kmem_cache_destroy(unstable_graph_node_cache);
+	kmem_cache_destroy(stable_graph_edge_cache);
+	kmem_cache_destroy(stable_graph_node_cache);
+#endif
 	kmem_cache_destroy(mm_slot_cache);
 	kmem_cache_destroy(stable_node_cache);
 	kmem_cache_destroy(rmap_item_cache);
@@ -430,6 +525,25 @@ static inline void free_mm_slot(struct mm_slot *mm_slot)
 {
 	kmem_cache_free(mm_slot_cache, mm_slot);
 }
+
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+static inline struct stable_graph_node *alloc_stable_graph_node(void)
+{
+	return kmem_cache_alloc(stable_graph_node_cache, GFP_KERNEL);
+}
+static inline struct stable_graph_edge *alloc_stable_graph_edge(void)
+{
+	return kmem_cache_alloc(stable_graph_edge_cache, GFP_KERNEL);
+}
+static inline struct unstable_graph_node *alloc_unstable_graph_node(void)
+{
+	return kmem_cache_alloc(unstable_graph_node_cache, GFP_KERNEL);
+}
+static inline struct unstable_graph_edge *alloc_unstable_graph_edge(void)
+{
+	return kmem_cache_alloc(unstable_graph_edge_cache, GFP_KERNEL);
+}
+#endif
 
 static struct mm_slot *get_mm_slot(struct mm_struct *mm)
 {
@@ -821,6 +935,7 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 				 root_unstable_tree + NUMA(rmap_item->nid));
 		ksm_pages_unshared--;
 		rmap_item->address &= PAGE_MASK;
+		//TODO remove from unstable graph
 	}
 out:
 	cond_resched(); /* we're called from many long loops */
@@ -1311,7 +1426,7 @@ out:
  * is already a ksm page, try_to_merge_with_ksm_page should be used.
  */
 MERGE_SINGLE_UNUSED
-static struct page *  try_to_merge_two_pages(struct rmap_item *rmap_item,
+static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
 					   struct page *page,
 					   struct rmap_item *tree_rmap_item,
 					   struct page *tree_page)
