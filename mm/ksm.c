@@ -216,7 +216,6 @@ struct stable_graph_edge {
 struct stable_graph_node {
 	struct list_head node_list;
 	struct list_head edge_list;
-	struct list_head relink_list;
 	struct stable_node *node;
 };
 
@@ -248,15 +247,15 @@ struct rmap_item {
 	union {
 		struct {
 			struct rb_node node; /* when node of unstable tree */
-#ifdef CONFIG_KSM_MERGE_SIMILAR
-			struct unstable_graph_node *graph_node;
-#endif
 		};
 		struct { /* when listed from stable tree */
 			struct stable_node *head;
 			struct hlist_node hlist;
 		};
 	};
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+	struct unstable_graph_node *graph_node;
+#endif
 };
 
 #ifdef CONFIG_KSM_MERGE_SIMILAR
@@ -270,7 +269,7 @@ struct unstable_graph_edge {
 struct unstable_graph_node {
 	struct list_head node_list;
 	struct list_head edge_list;
-	struct rmap_item *node;
+	struct rmap_item *tree_node;
 	bool changed;
 };
 struct stable_graph_search_result {
@@ -318,10 +317,12 @@ static struct ksm_scan ksm_scan = {
 static struct kmem_cache *rmap_item_cache;
 static struct kmem_cache *stable_node_cache;
 static struct kmem_cache *mm_slot_cache;
+#ifdef CONFIG_KSM_MERGE_SIMILAR
 static struct kmem_cache *stable_graph_node_cache;
 static struct kmem_cache *stable_graph_edge_cache;
 static struct kmem_cache *unstable_graph_node_cache;
 static struct kmem_cache *unstable_graph_edge_cache;
+#endif
 
 /* The number of nodes in the stable tree */
 static unsigned long ksm_pages_shared;
@@ -363,7 +364,7 @@ static unsigned long ksm_unstable_graph_size = 0;
 static unsigned long ksm_detected_similar_pages = 0;
 
 /* Similarity needed for two pages to be similar */
-static unsigned int ksm_similar_page_threshold = 128;
+static unsigned int ksm_similar_page_threshold = 4069;
 #endif
 
 /* Checksum of an empty (zeroed) page */
@@ -520,8 +521,10 @@ static inline void free_rmap_item(struct rmap_item *rmap_item)
 {
 	ksm_rmap_items--;
 	rmap_item->mm = NULL; /* debug safety */
+	#ifdef CONFIG_KSM_MERGE_SIMILAR
 	if (rmap_item->graph_node)
-		rmap_item->graph_node->node = NULL;
+		rmap_item->graph_node->tree_node = NULL;
+	#endif
 	kmem_cache_free(rmap_item_cache, rmap_item);
 }
 
@@ -589,7 +592,7 @@ ALLOC(free_stable_graph_node)
 static struct stable_graph_node *alloc_stable_graph_node(void)
 {
 	struct stable_graph_node *node;
-	node = kmem_cache_alloc(stable_graph_node_cache, GFP_KERNEL);
+	node = kmem_cache_zalloc(stable_graph_node_cache, GFP_KERNEL);
 	if (node)
 		ksm_stable_graph_size++;
 	return node;
@@ -597,13 +600,13 @@ static struct stable_graph_node *alloc_stable_graph_node(void)
 ALLOC(free_stable_graph_edge)
 static struct stable_graph_edge *alloc_stable_graph_edge(void)
 {
-	return kmem_cache_alloc(stable_graph_edge_cache, GFP_KERNEL);
+	return kmem_cache_zalloc(stable_graph_edge_cache, GFP_KERNEL);
 }
 ALLOC(free_unstable_graph_node)
 static struct unstable_graph_node *alloc_unstable_graph_node(void)
 {
 	struct unstable_graph_node *node;
-	node = kmem_cache_alloc(unstable_graph_node_cache, GFP_KERNEL);
+	node = kmem_cache_zalloc(unstable_graph_node_cache, GFP_KERNEL);
 	if (node)
 		ksm_unstable_graph_size++;
 	return node;
@@ -611,62 +614,10 @@ static struct unstable_graph_node *alloc_unstable_graph_node(void)
 ALLOC(free_unstable_graph_edge)
 static struct unstable_graph_edge *alloc_unstable_graph_edge(void)
 {
-	return kmem_cache_alloc(unstable_graph_edge_cache, GFP_KERNEL);
+	return kmem_cache_zalloc(unstable_graph_edge_cache, GFP_KERNEL);
 }
 
 #undef ALLOC
-
-static int add_stable_edge(struct stable_graph_node *node1,
-			   struct stable_graph_node *node2)
-{
-	struct stable_graph_edge *edge1, *edge2;
-
-	edge1 = alloc_stable_graph_edge();
-	if (!edge1)
-		goto out1;
-	edge2 = alloc_stable_graph_edge();
-	if (!edge2)
-		goto out2;
-	edge1->rev = edge2;
-	edge2->rev = edge1;
-	edge1->to = node2;
-	edge2->to = node1;
-	INIT_LIST_HEAD(&edge1->list);
-	INIT_LIST_HEAD(&edge2->list);
-	list_add(&edge1->list, &node1->edge_list);
-	list_add(&edge2->list, &node2->edge_list);
-	return 0;
-out2:
-	free_stable_graph_edge(edge1);
-out1:
-	return -ENOMEM;
-}
-
-static int add_unstable_edge(struct unstable_graph_node *node1,
-			     struct unstable_graph_node *node2)
-{
-	struct unstable_graph_edge *edge1, *edge2;
-
-	edge1 = alloc_unstable_graph_edge();
-	if (!edge1)
-		goto out1;
-	edge2 = alloc_unstable_graph_edge();
-	if (!edge2)
-		goto out2;
-	edge1->rev = edge2;
-	edge2->rev = edge1;
-	edge1->to = node2;
-	edge2->to = node1;
-	INIT_LIST_HEAD(&edge1->list);
-	INIT_LIST_HEAD(&edge2->list);
-	list_add(&edge1->list, &node1->edge_list);
-	list_add(&edge2->list, &node2->edge_list);
-	return 0;
-out2:
-	free_unstable_graph_edge(edge1);
-out1:
-	return -ENOMEM;
-}
 
 static void remove_stable_graph_node(struct stable_graph_node *node)
 {
@@ -703,8 +654,8 @@ static void remove_unstable_graph_node(struct unstable_graph_node *node)
 		free_stable_graph_edge(current_edge);
 	}
 	list_del(&node->node_list);
-	if (node->node)
-		node->node->graph_node = NULL;
+	if (node->tree_node)
+		node->tree_node->graph_node = NULL;
 	free_unstable_graph_node(node);
 }
 
@@ -719,11 +670,8 @@ static struct stable_graph_node *random_stable_graph_node(void)
 	case 1:
 		return list_entry(&stable_graph, struct stable_graph_node,
 				  node_list);
-	case 2:
-		significant_bits =
-			__builtin_clzl(ksm_stable_graph_size) +
-			(1 == __builtin_popcountl(ksm_stable_graph_size) ? 0 :
-										 1);
+	default:
+		significant_bits = roundup_pow_of_two(ksm_stable_graph_size);
 		//could only request enough bytes to minimize required entropy
 		do {
 			index = get_random_u64() &
@@ -748,11 +696,8 @@ static struct unstable_graph_node *random_unstable_graph_node(void)
 	case 1:
 		return list_entry(&stable_graph, struct unstable_graph_node,
 				  node_list);
-	case 2:
-		significant_bits =
-			__builtin_clzl(ksm_unstable_graph_size) +
-			(1 == __builtin_popcountl(ksm_unstable_graph_size) ? 0 :
-										   1);
+	default:
+		significant_bits = roundup_pow_of_two(ksm_unstable_graph_size);
 		//could only request enough bytes to minimize required entropy
 		do {
 			index = get_random_u64() &
@@ -938,6 +883,7 @@ static s32 compute_distance_unstable(struct page *curr,
 	char *current_page_mapped;
 	char *graph_page_mapped;
 	s32 count = 0;
+	u64 v1,v2;
 	cond_resched();
 	if (unstable_node == NULL)
 		return -1;
@@ -946,16 +892,17 @@ static s32 compute_distance_unstable(struct page *curr,
 		return -1;
 	graph_page_mapped = kmap_local_page(unstable_page);
 	current_page_mapped = kmap_local_page(curr);
-	for (int i = 0; i < PAGE_SIZE; i++) {
-		count += __builtin_popcount(current_page_mapped[i] ^
-					    graph_page_mapped[i]);
+	for (int i = 0; i < PAGE_SIZE; i+=sizeof(u64)) {
+		memcpy(&v1, current_page_mapped+i, sizeof(u64));
+		memcpy(&v2, graph_page_mapped+i, sizeof(u64));
+		count += hweight64(v1^v2);
 	}
-	kunmap_local(curr);
+	kunmap_local(current_page_mapped);
 	if (unstable_node->oldchecksum !=
 	    xxhash(graph_page_mapped, PAGE_SIZE, 0)) {
 		count = -1;
 	}
-	kunmap_local(unstable_page);
+	kunmap_local(graph_page_mapped);
 	put_page(unstable_page);
 	return count;
 }
@@ -1583,6 +1530,7 @@ static s32 compute_distance_stable(struct page *curr,
 	char *current_page_mapped;
 	char *graph_page_mapped;
 	s32 count = 0;
+	u64 v1,v2;
 
 	cond_resched();
 	if (graph_node == NULL)
@@ -1593,12 +1541,13 @@ static s32 compute_distance_stable(struct page *curr,
 		return -1;
 	graph_page_mapped = kmap_local_page(graph_page);
 	current_page_mapped = kmap_local_page(curr);
-	for (int i = 0; i < PAGE_SIZE; i++) {
-		count += __builtin_popcount(current_page_mapped[i] ^
-					    graph_page_mapped[i]);
+	for (int i = 0; i < PAGE_SIZE; i+=sizeof(u64)) {
+		memcpy(&v1, current_page_mapped+i, sizeof(u64));
+		memcpy(&v2, graph_page_mapped+i, sizeof(u64));
+		count+=hweight64(v1^v2);
 	}
-	kunmap_local(curr);
-	kunmap_local(graph_page);
+	kunmap_local(current_page_mapped);
+	kunmap_local(graph_page_mapped);
 	put_page(graph_page);
 	return count;
 }
@@ -1708,8 +1657,8 @@ find_most_similar_unstable_neighbour(struct page *self,
 	struct unstable_graph_edge *edge;
 	list_for_each_entry (edge, &from->edge_list, list) {
 		new_neigbour = edge->to;
-		new_weight =
-			compute_distance_unstable(self, new_neigbour->node);
+		new_weight = compute_distance_unstable(self,
+						       new_neigbour->tree_node);
 		if (new_weight == -1) {
 			remove_unstable_graph_node(new_neigbour);
 		}
@@ -1766,6 +1715,7 @@ static s32 find_most_similar_unstable(struct page *self, u64 depth,
 static int search_stable_graph(struct page *self,
 			       struct stable_graph_search_result *result)
 {
+	u64 param;
 	if (ksm_stable_graph_size == 0) {
 		result->result_nodes = 0;
 		result->similarity = 0;
@@ -1773,7 +1723,6 @@ static int search_stable_graph(struct page *self,
 		return 0;
 	}
 
-	u64 param;
 	param = num_probes_for_graph_size(ksm_stable_graph_size);
 	result->result_nodes =
 		kcalloc(param, sizeof(struct stable_graph_node *), GFP_KERNEL);
@@ -1805,13 +1754,13 @@ static int search_stable_graph(struct page *self,
 static int search_unstable_graph(struct page *self,
 				 struct unstable_graph_search_result *result)
 {
+	u64 param;
 	if (ksm_unstable_graph_size == 0) {
 		result->result_nodes = 0;
 		result->similarity = 0;
 		result->length = 0;
 		return 0;
 	}
-	u64 param;
 	param = num_probes_for_graph_size(ksm_unstable_graph_size);
 	result->result_nodes = kcalloc(
 		param, sizeof(struct unstable_graph_node *), GFP_KERNEL);
@@ -1856,12 +1805,12 @@ add_stable_node_to_graph(struct stable_node *node,
 		goto out2;
 	}
 	for (; alloc_counter < search_result->length * 2; alloc_counter++) {
-		edges[alloc_counter] =
-			kzalloc(sizeof(struct stable_graph_edge), GFP_KERNEL);
+		edges[alloc_counter] = alloc_stable_graph_edge();
 		if (!edges[alloc_counter])
 			goto out3;
 	}
 	graph_node->node = node;
+	node->graph_node = graph_node;
 	INIT_LIST_HEAD(&graph_node->node_list);
 	INIT_LIST_HEAD(&graph_node->edge_list);
 	for (u64 i = 0; i < search_result->length; i++) {
@@ -1906,12 +1855,12 @@ add_unstable_node_to_graph(struct rmap_item *node,
 		goto out2;
 	}
 	for (; alloc_counter < search_result->length * 2; alloc_counter++) {
-		edges[alloc_counter] =
-			kzalloc(sizeof(struct unstable_graph_edge), GFP_KERNEL);
+		edges[alloc_counter] = alloc_unstable_graph_edge();
 		if (!edges[alloc_counter])
 			goto out3;
 	}
-	graph_node->node = node;
+	graph_node->tree_node = node;
+	node->graph_node = graph_node;
 	INIT_LIST_HEAD(&graph_node->node_list);
 	INIT_LIST_HEAD(&graph_node->edge_list);
 	for (u64 i = 0; i < search_result->length; i++) {
@@ -1984,7 +1933,7 @@ out:
  * Note that this function upgrades page to ksm page: if one of the pages
  * is already a ksm page, try_to_merge_with_ksm_page should be used.
  */
-static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
+MERGE_SINGLE_UNUSED static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
 					   struct page *page,
 					   struct rmap_item *tree_rmap_item,
 					   struct page *tree_page)
@@ -2767,8 +2716,8 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 			 * add its rmap_item to the stable tree.
 			 * No adding to the stable graph required here, the page is already part of the graph.
 			 */
-			lock_page(kpage);
 			struct stable_node *node;
+			lock_page(kpage);
 			node = page_stable_node(kpage);
 			stable_tree_append(rmap_item, node,
 					   max_page_sharing_bypass);
@@ -2882,20 +2831,23 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 
 #ifdef CONFIG_KSM_MERGE_SIMILAR
 
-			if(stable_node){
+			if (stable_node) {
 				struct stable_graph_search_result search_result;
-				int err=search_stable_graph(kpage, &search_result);
-				if(!err){
-					err=add_stable_node_to_graph(stable_node, &search_result);
+				int err = search_stable_graph(kpage,
+							      &search_result);
+				if (!err) {
+					err = add_stable_node_to_graph(
+						stable_node, &search_result);
 					kfree(search_result.result_nodes);
 					kfree(search_result.similarity);
 				}
-				if(err){
-					remove_node_from_stable_tree(stable_node);
+				if (err) {
+					break_cow(tree_rmap_item);
+					break_cow(rmap_item);
 				}
 			}
 
-			#endif
+#endif
 
 			/*
 			 * If we fail to insert the page into the stable tree,
@@ -2921,17 +2873,208 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 				return;
 			split_huge_page(page);
 			unlock_page(page);
-		}else{
+		}
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+		else {
 			//search stable graph
 
-				struct stable_graph_search_result stable_search_result;
-				int err=search_stable_graph(page, &stable_search_result);
-				if(!err){
-
+			struct stable_graph_search_result stable_search_result;
+			int err = search_stable_graph(page,
+						      &stable_search_result);
+			if (!err) {
+				struct unstable_graph_search_result
+					unstable_search_result;
+				for (u64 i = 0; i < stable_search_result.length;
+				     i++) {
+					if (unlikely(
+						    stable_search_result
+							    .similarity[i] >
+						    ksm_similar_page_threshold)) {
+						struct vm_area_struct *vma;
+						ksm_detected_similar_pages++;
+						mmap_read_lock(mm);
+						vma = find_mergeable_vma(
+							mm, rmap_item->address);
+						mmap_read_unlock(mm);
+						if (vma) {
+							err = try_to_merge_one_page(
+								vma, page,
+								NULL);
+							if (err == 0) {
+								lock_page(page);
+								stable_node = stable_tree_insert(
+									page);
+								if (stable_node) {
+									stable_tree_append(
+										rmap_item,
+										stable_node,
+										false);
+								}
+								unlock_page(
+									page);
+								if (!stable_node) {
+									break_cow(
+										rmap_item);
+								} else {
+									err = add_stable_node_to_graph(
+										stable_node,
+										&stable_search_result);
+									if (err) {
+										break_cow(
+											rmap_item);
+									}
+								}
+							}
+						}
+						goto out1;
+					}
 				}
+				err = search_unstable_graph(
+					page, &unstable_search_result);
+				if (!err) {
+					bool hit = false;
+					for (u64 i = 0;
+					     i < unstable_search_result.length;
+					     i++) {
+						if (unlikely(
+							    unstable_search_result
+								    .similarity
+									    [i] >
+							    ksm_similar_page_threshold)) {
+							struct unstable_graph_node
+								*match;
+							struct rmap_item
+								*match_rmap;
+							struct page *match_page;
+							struct stable_node *
+								match_stable_node;
+							struct vm_area_struct
+								*vma;
+							ksm_detected_similar_pages++;
+							cond_resched();
+							hit = true;
+							match = unstable_search_result
+									.result_nodes
+										[i];
+							match_rmap =
+								match->tree_node;
+							match_page =
+								get_mergeable_page(
+									match_rmap);
+							mmap_read_lock(
+								match_rmap->mm);
+							vma = find_mergeable_vma(
+								match_rmap->mm,
+								match_rmap
+									->address);
+							mmap_read_unlock(
+								match_rmap->mm);
+							if (vma) {
+								err = try_to_merge_one_page(
+									vma,
+									match_page,
+									NULL);
+								if (err == 0) {
+									lock_page(
+										match_page);
+									match_stable_node = stable_tree_insert(
+										match_page);
+									if (match_stable_node) {
+										stable_tree_append(
+											match_rmap,
+											match_stable_node,
+											false);
+									}
+									unlock_page(
+										match_page);
+									if (!match_stable_node) {
+										break_cow(
+											match_rmap);
+									} else {
+										struct stable_graph_search_result
+											match_search_result;
+										err = search_stable_graph(
+											match_page,
+											&match_search_result);
+										if (!err) {
+											err = add_stable_node_to_graph(
+												match_stable_node,
+												&match_search_result);
+											kfree(match_search_result
+												      .result_nodes);
+											kfree(match_search_result
+												      .similarity);
+										}
+										if (err) {
+											break_cow(
+												match_rmap);
+										}
+									}
+									put_page(
+										match_page);
+									remove_unstable_graph_node(
+										match);
+								}
+							}
+						}
+					}
+					if (unlikely(hit)) {
+						struct vm_area_struct *vma;
+						mmap_read_lock(mm);
+						vma = find_mergeable_vma(
+							mm, rmap_item->address);
+						mmap_read_unlock(mm);
+						if (vma) {
+							err = try_to_merge_one_page(
+								vma, page,
+								NULL);
+							if (!err) {
+								lock_page(page);
+								stable_node = stable_tree_insert(
+									page);
+								if (stable_node) {
+									stable_tree_append(
+										rmap_item,
+										stable_node,
+										false);
+								}
+								unlock_page(
+									page);
+								if (!stable_node) {
+									break_cow(
+										rmap_item);
+								} else {
+									err = add_stable_node_to_graph(
+										stable_node,
+										&stable_search_result);
+									if (err)
+										break_cow(
+											rmap_item);
+								}
+							}
+						}
+					} else {
+						err = add_unstable_node_to_graph(
+							rmap_item,
+							&unstable_search_result);
+						if (err)
+							remove_rmap_item_from_tree(
+								rmap_item);
+					}
+					kfree(unstable_search_result
+						      .result_nodes);
+					kfree(stable_search_result.similarity);
+				}
+			out1:
+				kfree(stable_search_result.result_nodes);
+				kfree(stable_search_result.similarity);
+			}
+
 			//search unstable graph
 		}
+#endif
 	}
+
 #endif
 }
 
@@ -3816,6 +3959,16 @@ static ssize_t pages_unshared_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(pages_unshared);
 
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+static ssize_t detected_similar_pages_show(struct kobject *kobj,
+					   struct kobj_attribute *attr,
+					   char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_detected_similar_pages);
+}
+KSM_ATTR_RO(detected_similar_pages);
+#endif
+
 static ssize_t pages_volatile_show(struct kobject *kobj,
 				   struct kobj_attribute *attr, char *buf)
 {
@@ -3896,6 +4049,9 @@ static struct attribute *ksm_attrs[] = {
 	&stable_node_dups_attr.attr,
 	&stable_node_chains_prune_millisecs_attr.attr,
 	&use_zero_pages_attr.attr,
+#ifdef CONFIG_KSM_MERGE_SIMILAR
+	&detected_similar_pages_attr.attr,
+#endif
 	NULL,
 };
 
