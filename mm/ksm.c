@@ -217,6 +217,7 @@ struct stable_graph_node {
 	struct list_head node_list;
 	struct list_head edge_list;
 	struct stable_node *node;
+	bool pinned; //used to prevent freeing while the page is in the process of being connected to another page.
 };
 
 struct unstable_graph_node;
@@ -270,7 +271,7 @@ struct unstable_graph_node {
 	struct list_head node_list;
 	struct list_head edge_list;
 	struct rmap_item *tree_node;
-	bool changed;
+	bool pinned; //used to prevent freeing while the page is in the process of being connected to another page.
 };
 struct stable_graph_search_result {
 	struct stable_graph_node **result_nodes;
@@ -364,7 +365,7 @@ static unsigned long ksm_unstable_graph_size = 0;
 static unsigned long ksm_detected_similar_pages = 0;
 
 /* Similarity needed for two pages to be similar */
-static unsigned int ksm_similar_page_threshold = 4069;
+static unsigned int ksm_similar_page_threshold = PAGE_SIZE*7;
 #endif
 
 /* Checksum of an empty (zeroed) page */
@@ -1559,7 +1560,6 @@ static s32 compute_distance_stable(struct page *curr,
 	cond_resched();
 	if (graph_node == NULL)
 		return -1;
-	cond_resched();
 	graph_page = get_ksm_page(graph_node, GET_KSM_PAGE_NOLOCK);
 	if (graph_page == NULL)
 		return -1;
@@ -1650,8 +1650,8 @@ out:
 
 static s32
 find_most_similar_stable_neighbor(struct page *self,
-				   struct stable_graph_node *from,
-				   struct stable_graph_node **neighbor)
+				  struct stable_graph_node *from,
+				  struct stable_graph_node **neighbor)
 {
 	struct stable_graph_node *curr_neighbor = NULL, *new_neighbor;
 	s32 curr_weight = -1, new_weight;
@@ -1660,7 +1660,7 @@ find_most_similar_stable_neighbor(struct page *self,
 	list_for_each_entry (edge, &from->edge_list, list) {
 		new_neighbor = edge->to;
 		new_weight = compute_distance_stable(self, new_neighbor->node);
-		if (new_weight == -1) {
+		if (new_weight == -1 && !new_neighbor->pinned) {
 			list_del(&new_neighbor->node_list);
 			list_add(&new_neighbor->node_list, &remove_list);
 		}
@@ -1676,8 +1676,8 @@ find_most_similar_stable_neighbor(struct page *self,
 
 static s32
 find_most_similar_unstable_neighbor(struct page *self,
-				     struct unstable_graph_node *from,
-				     struct unstable_graph_node **neighbor)
+				    struct unstable_graph_node *from,
+				    struct unstable_graph_node **neighbor)
 {
 	struct unstable_graph_node *curr_neighbor = NULL, *new_neighbor;
 	s32 curr_weight = -1, new_weight;
@@ -1687,7 +1687,7 @@ find_most_similar_unstable_neighbor(struct page *self,
 		new_neighbor = edge->to;
 		new_weight = compute_distance_unstable(self,
 						       new_neighbor->tree_node);
-		if (new_weight == -1) {
+		if (new_weight == -1 && !new_neighbor->pinned) {
 			list_del(&new_neighbor->node_list);
 			list_add(&new_neighbor->node_list, &remove_list);
 		}
@@ -1714,20 +1714,22 @@ static s32 find_most_similar_stable(struct page *self,
 		}
 		curr_weight =
 			compute_distance_stable(self, curr_neighbor->node);
-		if (curr_weight == -1) {
+		if (curr_weight == -1 && !new_neighbor->pinned) {
 			remove_stable_graph_node(curr_neighbor);
 		}
 	}
 	while (true) {
 		new_weight = find_most_similar_stable_neighbor(
 			self, curr_neighbor, &new_neighbor);
-		if (new_weight < curr_weight && new_weight != -1) {
+		if (new_weight > curr_weight) {
 			curr_neighbor = new_neighbor;
 			curr_weight = new_weight;
 		} else
 			break;
 	}
 	*neighbor = curr_neighbor;
+	if (curr_weight != -1)
+		curr_neighbor->pinned = true;
 	return curr_weight;
 }
 static s32 find_most_similar_unstable(struct page *self,
@@ -1744,20 +1746,21 @@ static s32 find_most_similar_unstable(struct page *self,
 		curr_weight = compute_distance_unstable(
 			self, curr_neighbor->tree_node);
 
-		if (curr_weight == -1) {
+		if (curr_weight == -1 && !new_neighbor->pinned) {
 			remove_unstable_graph_node(curr_neighbor);
 		}
 	}
 	while (true) {
 		new_weight = find_most_similar_unstable_neighbor(
 			self, curr_neighbor, &new_neighbor);
-		if (new_weight < curr_weight && new_weight != -1) {
+		if (new_weight > curr_weight) {
 			curr_neighbor = new_neighbor;
 			curr_weight = new_weight;
 		} else
 			break;
 	}
 	*neighbor = curr_neighbor;
+	curr_neighbor->pinned = true;
 	return curr_weight;
 }
 
@@ -1785,9 +1788,11 @@ static int search_stable_graph(struct page *self,
 	result->length = param;
 	for (u64 i = 0; i < result->length; i++) {
 		result->similarity[i] = find_most_similar_stable(
-			self,  &result->result_nodes[i]);
+			self, &result->result_nodes[i]);
 		if (result->similarity[i] == -1) {
-			result->length=i;
+			//shrink resulting array
+			result->length--;
+			i--;
 		}
 	}
 	//retry if no node was found to prevent empty matches.
@@ -1825,7 +1830,9 @@ static int search_unstable_graph(struct page *self,
 		result->similarity[i] = find_most_similar_unstable(
 			self, &result->result_nodes[i]);
 		if (result->similarity[i] == -1) {
-			result->length=i;
+			//shrink resulting array
+			result->length--;
+			i--;
 		}
 	}
 	//retry if no node was found to prevent empty matches.
@@ -1874,6 +1881,7 @@ add_stable_node_to_graph(struct stable_node *node,
 		list_add(&edge->list, &graph_node->edge_list);
 		list_add(&rev_edge->list,
 			 &search_result->result_nodes[i]->edge_list);
+		search_result->result_nodes[i]->pinned = false;
 	}
 	list_add(&graph_node->node_list, &stable_graph);
 	kfree(edges);
@@ -2937,7 +2945,8 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 					if (unlikely(
 						    stable_search_result
 							    .similarity[i] >
-						    ksm_similar_page_threshold)) {
+						    READ_ONCE(
+							    ksm_similar_page_threshold))) {
 						struct vm_area_struct *vma;
 						ksm_detected_similar_pages++;
 						mmap_read_lock(mm);
@@ -2988,7 +2997,8 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 							    unstable_search_result
 								    .similarity
 									    [i] >
-							    ksm_similar_page_threshold)) {
+							    READ_ONCE(
+								    ksm_similar_page_threshold))) {
 							struct unstable_graph_node
 								*match;
 							struct rmap_item
