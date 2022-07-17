@@ -1922,7 +1922,7 @@ add_unstable_node_to_graph(struct rmap_item *node,
 		list_add(&rev_edge->list,
 			 &search_result->result_nodes[i]->edge_list);
 	}
-	list_add(&graph_node->node_list, &stable_graph);
+	list_add(&graph_node->node_list, &unstable_graph);
 	kfree(edges);
 	return 0;
 out3:
