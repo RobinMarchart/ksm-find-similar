@@ -678,7 +678,7 @@ static struct stable_graph_node *random_stable_graph_node(void)
 	case 0:
 		return NULL;
 	case 1:
-		return list_entry(&stable_graph, struct stable_graph_node,
+		return list_entry(stable_graph.next, struct stable_graph_node,
 				  node_list);
 	default:
 		significant_bits = roundup_pow_of_two(ksm_stable_graph_size);
@@ -704,7 +704,7 @@ static struct unstable_graph_node *random_unstable_graph_node(void)
 	case 0:
 		return NULL;
 	case 1:
-		return list_entry(&stable_graph, struct unstable_graph_node,
+		return list_entry(unstable_graph.next, struct unstable_graph_node,
 				  node_list);
 	default:
 		significant_bits = roundup_pow_of_two(ksm_unstable_graph_size);
