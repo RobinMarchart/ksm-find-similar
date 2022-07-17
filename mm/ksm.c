@@ -3097,7 +3097,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 							rmap_item);
 				}
 				kfree(unstable_search_result.result_nodes);
-				kfree(stable_search_result.similarity);
+				kfree(unstable_search_result.similarity);
 			}
 		out1:
 			kfree(stable_search_result.result_nodes);
