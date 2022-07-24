@@ -275,12 +275,12 @@ struct unstable_graph_node {
 };
 struct stable_graph_search_result {
 	struct stable_graph_node **result_nodes;
-	s32 *similarity;
+	s64 *similarity;
 	u64 length;
 };
 struct unstable_graph_search_result {
 	struct unstable_graph_node **result_nodes;
-	s32 *similarity;
+	s64 *similarity;
 	u64 length;
 };
 #endif
@@ -886,13 +886,13 @@ static struct page *get_mergeable_page(struct rmap_item *rmap_item)
 }
 
 #ifdef CONFIG_KSM_MERGE_SIMILAR
-static s32 compute_distance_unstable(struct page *curr,
+static s64 compute_distance_unstable(struct page *curr,
 				     struct rmap_item *unstable_node)
 {
 	struct page *unstable_page;
 	char *current_page_mapped;
 	char *graph_page_mapped;
-	s32 count = 0;
+	s64 count = 0;
 	u64 v1, v2;
 	cond_resched();
 	if (unstable_node == NULL)
@@ -1533,13 +1533,13 @@ out:
 }
 
 #ifdef CONFIG_KSM_MERGE_SIMILAR
-static s32 compute_distance_stable(struct page *curr,
+static s64 compute_distance_stable(struct page *curr,
 				   struct stable_node *graph_node)
 {
 	struct page *graph_page;
 	char *current_page_mapped;
 	char *graph_page_mapped;
-	s32 count = 0;
+	s64 count = 0;
 	u64 v1, v2;
 
 	cond_resched();
@@ -1633,13 +1633,13 @@ out:
 
 #ifdef CONFIG_KSM_MERGE_SIMILAR
 
-static s32
+static s64
 find_most_similar_stable_neighbor(struct page *self,
 				  struct stable_graph_node *from,
 				  struct stable_graph_node **neighbor)
 {
 	struct stable_graph_node *curr_neighbor = NULL, *new_neighbor;
-	s32 curr_weight = -1, new_weight;
+	s64 curr_weight = -1, new_weight;
 	struct stable_graph_edge *edge;
 	LIST_HEAD(remove_list);
 	list_for_each_entry (edge, &from->edge_list, list) {
@@ -1662,13 +1662,13 @@ find_most_similar_stable_neighbor(struct page *self,
 	return curr_weight;
 }
 
-static s32
+static s64
 find_most_similar_unstable_neighbor(struct page *self,
 				    struct unstable_graph_node *from,
 				    struct unstable_graph_node **neighbor)
 {
 	struct unstable_graph_node *curr_neighbor = NULL, *new_neighbor;
-	s32 curr_weight = -1, new_weight;
+	s64 curr_weight = -1, new_weight;
 	struct unstable_graph_edge *edge;
 	LIST_HEAD(remove_list);
 	list_for_each_entry (edge, &from->edge_list, list) {
@@ -1691,11 +1691,11 @@ find_most_similar_unstable_neighbor(struct page *self,
 	return curr_weight;
 }
 
-static s32 find_most_similar_stable(struct page *self,
+static s64 find_most_similar_stable(struct page *self,
 				    struct stable_graph_node **neighbor)
 {
 	struct stable_graph_node *curr_neighbor, *new_neighbor;
-	s32 curr_weight = -1, new_weight;
+	s64 curr_weight = -1, new_weight;
 	while (curr_weight == -1) {
 		curr_neighbor = random_stable_graph_node();
 		if (curr_neighbor == NULL) {
@@ -1722,11 +1722,11 @@ static s32 find_most_similar_stable(struct page *self,
 		curr_neighbor->pinned = true;
 	return curr_weight;
 }
-static s32 find_most_similar_unstable(struct page *self,
+static s64 find_most_similar_unstable(struct page *self,
 				      struct unstable_graph_node **neighbor)
 {
 	struct unstable_graph_node *curr_neighbor, *new_neighbor;
-	s32 curr_weight = -1, new_weight;
+	s64 curr_weight = -1, new_weight;
 	while (curr_weight == -1) {
 		curr_neighbor = random_unstable_graph_node();
 		if (curr_neighbor == NULL) {
@@ -1770,7 +1770,7 @@ static int search_stable_graph(struct page *self,
 		kcalloc(param, sizeof(struct stable_graph_node *), GFP_KERNEL);
 	if (!result->result_nodes)
 		return -ENOMEM;
-	result->similarity = kcalloc(param, sizeof(s32), GFP_KERNEL);
+	result->similarity = kcalloc(param, sizeof(s64), GFP_KERNEL);
 	if (!result->similarity) {
 		kfree(result->result_nodes);
 		return -ENOMEM;
@@ -1809,7 +1809,7 @@ static int search_unstable_graph(struct page *self,
 		param, sizeof(struct unstable_graph_node *), GFP_KERNEL);
 	if (!result->result_nodes)
 		return -ENOMEM;
-	result->similarity = kcalloc(param, sizeof(s32), GFP_KERNEL);
+	result->similarity = kcalloc(param, sizeof(s64), GFP_KERNEL);
 	if (!result->similarity) {
 		kfree(result->result_nodes);
 		return -ENOMEM;
