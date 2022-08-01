@@ -673,6 +673,7 @@ static struct stable_graph_node *random_stable_graph_node(void)
 {
 	u8 significant_bits;
 	u64 index;
+	u32 tries = 1;
 	struct list_head *cursor;
 	switch (ksm_stable_graph_size) {
 	case 0:
@@ -682,11 +683,20 @@ static struct stable_graph_node *random_stable_graph_node(void)
 				  node_list);
 	default:
 		significant_bits = roundup_pow_of_two(ksm_stable_graph_size);
+
 		//could only request enough bytes to minimize required entropy
 		do {
 			index = get_random_u64() &
 				(0xffffffffffffffffu >> significant_bits);
 			//there is probably a more elegant solution. worst case nearly 50% are rejected
+			tries++;
+			if (!tries) {
+				printk(KERN_WARNING
+				       "unable to find random stable node\n");
+				return list_entry(stable_graph.next,
+						  struct stable_graph_node,
+						  node_list);
+			}
 		} while (index >= ksm_stable_graph_size);
 		cursor = stable_graph.next;
 		for (int i = 0; i < index; i++) {
@@ -699,19 +709,30 @@ static struct unstable_graph_node *random_unstable_graph_node(void)
 {
 	u8 significant_bits;
 	u64 index;
+	u32 tries = 1;
 	struct list_head *cursor;
 	switch (ksm_unstable_graph_size) {
 	case 0:
 		return NULL;
 	case 1:
-		return list_entry(unstable_graph.next, struct unstable_graph_node,
-				  node_list);
+		return list_entry(unstable_graph.next,
+				  struct unstable_graph_node, node_list);
 	default:
 		significant_bits = roundup_pow_of_two(ksm_unstable_graph_size);
 		//could only request enough bytes to minimize required entropy
 		do {
 			index = get_random_u64() &
 				(0xffffffffffffffffu >> significant_bits);
+			//prevent infinite loop
+			tries++;
+			if (!tries) {
+				printk(KERN_WARNING
+				       "unable to find random unstable node\n");
+				return list_entry(unstable_graph.next,
+						  struct unstable_graph_node,
+						  node_list);
+			}
+
 			//there is probably a more elegant solution. worst case nearly 50% are rejected
 		} while (index >= ksm_unstable_graph_size);
 		cursor = unstable_graph.next;
@@ -2943,30 +2964,39 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 						mm, rmap_item->address);
 					mmap_read_unlock(mm);
 					if (vma) {
+						//the page is marked read only
 						err = try_to_merge_one_page(
 							vma, page, NULL);
 						if (err == 0) {
-							lock_page(page);
-							stable_node =
-								stable_tree_insert(
-									page);
-							if (stable_node) {
-								stable_tree_append(
-									rmap_item,
-									stable_node,
-									false);
-							}
-							unlock_page(page);
-							if (!stable_node) {
+							//check checksum again
+							if (rmap_item->oldchecksum !=
+							    calc_checksum(
+								    page)) {
 								break_cow(
 									rmap_item);
 							} else {
-								err = add_stable_node_to_graph(
-									stable_node,
-									&stable_search_result);
-								if (err) {
+								lock_page(page);
+								stable_node = stable_tree_insert(
+									page);
+								if (stable_node) {
+									stable_tree_append(
+										rmap_item,
+										stable_node,
+										false);
+								}
+								unlock_page(
+									page);
+								if (!stable_node) {
 									break_cow(
 										rmap_item);
+								} else {
+									err = add_stable_node_to_graph(
+										stable_node,
+										&stable_search_result);
+									if (err) {
+										break_cow(
+											rmap_item);
+									}
 								}
 							}
 						}
@@ -2994,6 +3024,56 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 						struct vm_area_struct *vma;
 						ksm_detected_similar_pages++;
 						cond_resched();
+						//add here already to free pined nodes
+						if (!hit) {
+							struct vm_area_struct
+								*vma;
+							mmap_read_lock(mm);
+							vma = find_mergeable_vma(
+								mm,
+								rmap_item
+									->address);
+							mmap_read_unlock(mm);
+							if (vma) {
+								err = try_to_merge_one_page(
+									vma,
+									page,
+									NULL);
+								if (!err) {
+									if (rmap_item
+										    ->oldchecksum !=
+									    calc_checksum(
+										    page)) {
+										break_cow(
+											rmap_item);
+									} else {
+										lock_page(
+											page);
+										stable_node = stable_tree_insert(
+											page);
+										if (stable_node) {
+											stable_tree_append(
+												rmap_item,
+												stable_node,
+												false);
+										}
+										unlock_page(
+											page);
+										if (!stable_node) {
+											break_cow(
+												rmap_item);
+										} else {
+											err = add_stable_node_to_graph(
+												stable_node,
+												&stable_search_result);
+											if (err)
+												break_cow(
+													rmap_item);
+										}
+									}
+								}
+							}
+						}
 						hit = true;
 						match = unstable_search_result
 								.result_nodes[i];
@@ -3011,84 +3091,58 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 								vma, match_page,
 								NULL);
 							if (err == 0) {
-								lock_page(
-									match_page);
-								match_stable_node = stable_tree_insert(
-									match_page);
-								if (match_stable_node) {
-									stable_tree_append(
-										match_rmap,
-										match_stable_node,
-										false);
-								}
-								unlock_page(
-									match_page);
-								if (!match_stable_node) {
+								if (match_rmap
+									    ->oldchecksum !=
+								    calc_checksum(
+									    match_page)) {
 									break_cow(
 										match_rmap);
 								} else {
-									struct stable_graph_search_result
-										match_search_result;
-									err = search_stable_graph(
-										match_page,
-										&match_search_result);
-									if (!err) {
-										err = add_stable_node_to_graph(
+									lock_page(
+										match_page);
+									match_stable_node = stable_tree_insert(
+										match_page);
+									if (match_stable_node) {
+										stable_tree_append(
+											match_rmap,
 											match_stable_node,
-											&match_search_result);
-										kfree(match_search_result
-											      .result_nodes);
-										kfree(match_search_result
-											      .similarity);
+											false);
 									}
-									if (err) {
+									unlock_page(
+										match_page);
+									if (!match_stable_node) {
 										break_cow(
 											match_rmap);
+									} else {
+										struct stable_graph_search_result
+											match_search_result;
+										err = search_stable_graph(
+											match_page,
+											&match_search_result);
+										if (!err) {
+											err = add_stable_node_to_graph(
+												match_stable_node,
+												&match_search_result);
+											kfree(match_search_result
+												      .result_nodes);
+											kfree(match_search_result
+												      .similarity);
+										}
+										if (err) {
+											break_cow(
+												match_rmap);
+										}
 									}
+									put_page(
+										match_page);
+									remove_unstable_graph_node(
+										match);
 								}
-								put_page(
-									match_page);
-								remove_unstable_graph_node(
-									match);
 							}
 						}
 					}
 				}
-				if (unlikely(hit)) {
-					struct vm_area_struct *vma;
-					mmap_read_lock(mm);
-					vma = find_mergeable_vma(
-						mm, rmap_item->address);
-					mmap_read_unlock(mm);
-					if (vma) {
-						err = try_to_merge_one_page(
-							vma, page, NULL);
-						if (!err) {
-							lock_page(page);
-							stable_node =
-								stable_tree_insert(
-									page);
-							if (stable_node) {
-								stable_tree_append(
-									rmap_item,
-									stable_node,
-									false);
-							}
-							unlock_page(page);
-							if (!stable_node) {
-								break_cow(
-									rmap_item);
-							} else {
-								err = add_stable_node_to_graph(
-									stable_node,
-									&stable_search_result);
-								if (err)
-									break_cow(
-										rmap_item);
-							}
-						}
-					}
-				} else {
+				if (!hit) {
 					err = add_unstable_node_to_graph(
 						rmap_item,
 						&unstable_search_result);
@@ -4003,6 +4057,30 @@ static ssize_t detected_similar_pages_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%lu\n", ksm_detected_similar_pages);
 }
 KSM_ATTR_RO(detected_similar_pages);
+
+static ssize_t similar_page_threshold_show(struct kobject *kobj,
+					   struct kobj_attribute *attr,
+					   char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ksm_similar_page_threshold);
+}
+
+static ssize_t similar_page_threshold_store(struct kobject *kobj,
+					    struct kobj_attribute *attr,
+					    const char *buf, size_t count)
+{
+	unsigned long similarity;
+	int err;
+
+	err = kstrtoul(buf, 10, &similarity);
+	if (err)
+		return -EINVAL;
+
+	ksm_similar_page_threshold = similarity;
+
+	return count;
+}
+KSM_ATTR(similar_page_threshold);
 #endif
 
 static ssize_t pages_volatile_show(struct kobject *kobj,
@@ -4087,6 +4165,7 @@ static struct attribute *ksm_attrs[] = {
 	&use_zero_pages_attr.attr,
 #ifdef CONFIG_KSM_MERGE_SIMILAR
 	&detected_similar_pages_attr.attr,
+	&similar_page_threshold_attr.attr,
 #endif
 	NULL,
 };
